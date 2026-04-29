@@ -1,0 +1,14 @@
+[project]
+name = "contactile-3dfbs-lab"
+version = "0.1.0"
+description = "Contactile 3DFBS sensor data acquisition and visualization"
+requires-python = "==3.10.*"
+
+dependencies = [
+    "FBS3D_CXX_Pybind",
+    "matplotlib>=3.5",
+    "pyyaml>=6.0",
+]
+
+[tool.uv.sources]
+FBS3D_CXX_Pybind = { path = "../vendor/PythonLIN/fbs3d_cxx_pybind-1.0.2-cp310-cp310-linux_x86_64.whl" }
