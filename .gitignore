@@ -1,0 +1,23 @@
+# Python
+python_ws/.venv/
+__pycache__/
+*.pyc
+
+# C++
+cpp_ws/build/
+
+# ROS2
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# Data
+data/*
+!data/.gitkeep
+
+# Vendor SDK (原厂二进制，从 USB 盘复制)
+vendor/
+
+# IDE
+.vscode/
+.idea/

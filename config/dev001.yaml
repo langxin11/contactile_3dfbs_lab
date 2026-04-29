@@ -1,0 +1,11 @@
+# Contactile 3DFBS DEV001 默认配置
+# 可通过 scripts 中的环境变量或命令行参数覆盖
+
+port: "/dev/ttyACM0"
+baud_rate: 9600
+sensor_count: 1
+publish_rate: 100.0
+frame_id: "contactile_link"
+mock_mode: false
+bias_on_startup: true
+enable_logging: false

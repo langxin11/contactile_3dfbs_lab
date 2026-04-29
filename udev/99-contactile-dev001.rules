@@ -1,0 +1,3 @@
+# Contactile DEV001 — 固定串口设备名
+# 用法: sudo cp udev/99-contactile-dev001.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules && sudo udevadm trigger
+SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="4001", SYMLINK+="contactile_dev001", MODE="0666"
