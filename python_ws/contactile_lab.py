@@ -3,12 +3,24 @@
 Contactile 3DFBS lab CLI — 统一的传感器采集、记录、实时预览和回放工具。
 
 用法:
-    python contactile_lab.py read --count 10
-    python contactile_lab.py record --duration 10 --output data/run.csv
-    python contactile_lab.py live --sensors 0,1 --rate 1000 --confirm-no-load
-    python contactile_lab.py live --sensors 0,1 --rate 1000 --confirm-no-load
-    python contactile_lab.py replay data/run.csv
-    python contactile_lab.py check --duration 5
+    # 快速读取（单传感器，含 software baseline）
+    uv run python contactile_lab.py read --confirm-no-load --count 20
+
+    # 记录到 CSV
+    uv run python contactile_lab.py record --confirm-no-load --duration 10
+
+    # 双传感器实时力曲线
+    uv run python contactile_lab.py live --confirm-no-load --sensors 0,1
+
+    # 离线回放
+    uv run python contactile_lab.py replay data/run.csv
+
+    # 跳过 software baseline，仅用 SDK bias 对比
+    uv run python contactile_lab.py check --confirm-no-load --no-software-baseline
+
+默认先执行 SDK bias，再采样 2 秒软件基准；若任一轴标准差超过 0.02 N，
+会认为基准期间存在触碰或扰动并停止运行。CSV 默认保存校正后的力数据。
+--rate 是 CLI 目标输出频率；SDK 实际更新更快时会按 timestamp 软件降采样。
 """
 
 import csv
@@ -43,6 +55,12 @@ DEFAULT_WINDOW_SEC = 4.0
 DEFAULT_VIEWPORT_WIDTH = 1600
 DEFAULT_VIEWPORT_HEIGHT = 1200
 DEFAULT_FORCE_LIMIT_N = 1.0
+# 软件基准默认窗口；1000 Hz 下约 2000 点，兼顾启动速度和均值稳定性
+DEFAULT_BASELINE_DURATION_SEC = 2.0
+# 任一力轴标准差超过该阈值，视为基准期间存在触碰或环境扰动
+DEFAULT_BASELINE_STD_LIMIT_N = 0.02
+# 低于该样本数时均值不可信，通常表示传感器未出数或索引错误
+MIN_BASELINE_SAMPLES = 20
 # Dear PyGui 全局字体大小，默认约 13px，增大到 22px 改善高分辨率屏幕可读性
 DPG_FONT_SIZE = 22
 DPG_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
@@ -109,6 +127,36 @@ class MultiSample:
     samples: dict[int, Sample]
 
 
+@dataclass(frozen=True)
+class ForceOffset:
+    """单个传感器的软件基准 offset。
+
+    Args (字段):
+        fx: X 方向力 offset，单位 N，sensor frame。
+        fy: Y 方向力 offset，单位 N，sensor frame。
+        fz: Z 方向力 offset，单位 N，sensor frame。
+    """
+
+    fx: float
+    fy: float
+    fz: float
+
+
+@dataclass(frozen=True)
+class BaselineStats:
+    """软件基准统计结果。
+
+    Args (字段):
+        offset: 基准窗口内的平均力，单位 N。
+        std: 基准窗口内的标准差，单位 N。
+        count: 参与统计的新样本数量。
+    """
+
+    offset: ForceOffset
+    std: ForceOffset
+    count: int
+
+
 # ── 工具函数 ──────────────────────────────────────────────────────
 
 
@@ -170,7 +218,8 @@ def _parse_sensor_list(value: str) -> list[int]:
 class SensorSession:
     """管理传感器连接的上下文管理器，确保异常时释放串口。
 
-    进入上下文时自动连接串口、执行 bias 校准（如果 bias=True）。
+    进入上下文时自动连接串口、执行 bias 校准（如果 bias=True），
+    并可计算软件基准。
     退出上下文时自动调用 stopListeningAndDisconnect() 释放串口。
 
     Args:
@@ -178,6 +227,10 @@ class SensorSession:
         rate_hz: 目标采集频率，可选 100/500/1000 Hz。
         sensor_index: 主传感器索引，范围 0..MAX_SENSOR_SLOTS-1。
         bias: 是否在连接后执行 bias 校准。
+        software_baseline: 是否启用运行时软件基准扣除。
+        baseline_duration_sec: 软件基准采样时长，单位 s。
+        baseline_std_limit_n: 软件基准扰动检测阈值，单位 N。
+        baseline_sensor_indices: 需要建立软件基准的传感器索引列表。
     """
 
     def __init__(
@@ -187,6 +240,10 @@ class SensorSession:
         sensor_index: int = DEFAULT_SENSOR,
         *,
         bias: bool = True,
+        software_baseline: bool = True,
+        baseline_duration_sec: float = DEFAULT_BASELINE_DURATION_SEC,
+        baseline_std_limit_n: float = DEFAULT_BASELINE_STD_LIMIT_N,
+        baseline_sensor_indices: Optional[list[int]] = None,
     ) -> None:
         if not 0 <= sensor_index < MAX_SENSOR_SLOTS:
             raise ValueError(f"传感器索引必须在 0..{MAX_SENSOR_SLOTS - 1} 之间")
@@ -194,9 +251,17 @@ class SensorSession:
         self.rate_hz = rate_hz
         self.sensor_index = sensor_index
         self.bias = bias
+        self.software_baseline = software_baseline
+        self.baseline_duration_sec = baseline_duration_sec
+        self.baseline_std_limit_n = baseline_std_limit_n
+        self.baseline_sensor_indices = baseline_sensor_indices or [sensor_index]
+        for baseline_sensor_index in self.baseline_sensor_indices:
+            if not 0 <= baseline_sensor_index < MAX_SENSOR_SLOTS:
+                raise ValueError(f"传感器索引必须在 0..{MAX_SENSOR_SLOTS - 1} 之间")
         self.listener: Optional[fbs.PTSDKListener] = None
         self.sensors: list[fbs.PTSDKSensor] = []
         self._last_timestamp_us: Optional[int] = None
+        self._force_offsets: dict[int, ForceOffset] = {}
 
     def __enter__(self) -> "SensorSession":
         _check_port(self.port)
@@ -226,7 +291,9 @@ class SensorSession:
                 if not self.listener.sendBiasRequest():
                     raise RuntimeError("Bias 失败")
                 typer.echo("Bias 成功")
-        except Exception:
+            if self.software_baseline:
+                self._compute_software_baseline(self.baseline_sensor_indices)
+        except BaseException:
             self.close()
             raise
         return self
@@ -243,7 +310,7 @@ class SensorSession:
     def read_current(self) -> Sample:
         return self.read_sensor(self.sensor_index)
 
-    def read_sensor(self, sensor_index: int) -> Sample:
+    def _read_raw(self, sensor_index: int) -> Sample:
         sensor = self.sensors[sensor_index]
         force = sensor.getGlobalForce()
         timestamp_us = int(sensor.getTimestamp_us())
@@ -254,6 +321,92 @@ class SensorSession:
             fy=float(force[1]),
             fz=float(force[2]),
         )
+
+    def read_sensor(self, sensor_index: int) -> Sample:
+        raw = self._read_raw(sensor_index)
+        offset = self._force_offsets.get(sensor_index, ForceOffset(0.0, 0.0, 0.0))
+        return Sample(
+            timestamp_us=raw.timestamp_us,
+            t_monotonic_ns=raw.t_monotonic_ns,
+            fx=raw.fx - offset.fx,
+            fy=raw.fy - offset.fy,
+            fz=raw.fz - offset.fz,
+        )
+
+    def _should_accept_timestamp(
+        self,
+        timestamp_us: int,
+        last_timestamp_us: Optional[int],
+    ) -> bool:
+        """按目标输出频率筛选 timestamp，避免 SDK 后台线程过快更新数据。"""
+        if timestamp_us == 0:
+            return False
+        if last_timestamp_us is None:
+            return True
+        target_interval_us = int(1_000_000 / self.rate_hz)
+        return timestamp_us - last_timestamp_us >= target_interval_us
+
+    def _compute_software_baseline(self, sensor_indices: list[int]) -> None:
+        """采集无负载窗口并计算运行时 offset，标准差过大时拒绝继续。"""
+        if self.baseline_duration_sec <= 0:
+            return
+        typer.echo(
+            "软件基准采样中（请保持传感器无负载）: "
+            f"{self.baseline_duration_sec:.1f}s, std limit={self.baseline_std_limit_n:.3f} N"
+        )
+        values: dict[int, list[Sample]] = {
+            sensor_index: [] for sensor_index in sensor_indices
+        }
+        last_timestamp_us: dict[int, int] = {}
+        deadline = time.monotonic() + self.baseline_duration_sec
+        sleep_sec = max(0.0002, min(0.002, 0.5 / self.rate_hz))
+        while time.monotonic() < deadline:
+            for sensor_index in sensor_indices:
+                sample = self._read_raw(sensor_index)
+                last_timestamp = last_timestamp_us.get(sensor_index)
+                if not self._should_accept_timestamp(sample.timestamp_us, last_timestamp):
+                    continue
+                last_timestamp_us[sensor_index] = sample.timestamp_us
+                values[sensor_index].append(sample)
+            time.sleep(sleep_sec)
+
+        for sensor_index, samples in values.items():
+            if len(samples) < MIN_BASELINE_SAMPLES:
+                raise RuntimeError(
+                    f"S{sensor_index} 软件基准样本不足: "
+                    f"{len(samples)} < {MIN_BASELINE_SAMPLES}"
+                )
+            fx_values = [sample.fx for sample in samples]
+            fy_values = [sample.fy for sample in samples]
+            fz_values = [sample.fz for sample in samples]
+            stats = BaselineStats(
+                offset=ForceOffset(
+                    fx=statistics.fmean(fx_values),
+                    fy=statistics.fmean(fy_values),
+                    fz=statistics.fmean(fz_values),
+                ),
+                std=ForceOffset(
+                    fx=statistics.pstdev(fx_values),
+                    fy=statistics.pstdev(fy_values),
+                    fz=statistics.pstdev(fz_values),
+                ),
+                count=len(samples),
+            )
+            max_std = max(stats.std.fx, stats.std.fy, stats.std.fz)
+            if max_std > self.baseline_std_limit_n:
+                raise RuntimeError(
+                    f"S{sensor_index} 软件基准扰动过大: "
+                    f"std Fx/Fy/Fz={stats.std.fx:.5f}/{stats.std.fy:.5f}/{stats.std.fz:.5f} N, "
+                    f"limit={self.baseline_std_limit_n:.5f} N"
+                )
+            self._force_offsets[sensor_index] = stats.offset
+            typer.echo(
+                f"S{sensor_index} 软件基准: "
+                f"offset Fx/Fy/Fz="
+                f"{stats.offset.fx:.5f}/{stats.offset.fy:.5f}/{stats.offset.fz:.5f} N, "
+                f"std={stats.std.fx:.5f}/{stats.std.fy:.5f}/{stats.std.fz:.5f} N, "
+                f"samples={stats.count}"
+            )
 
     def next_sample(self, timeout_sec: float = 2.0) -> Sample:
         """等待并返回下一帧新样本。
@@ -274,7 +427,7 @@ class SensorSession:
         sleep_sec = max(0.0002, min(0.002, 0.5 / self.rate_hz))
         while True:
             sample = self.read_current()
-            if sample.timestamp_us != 0 and sample.timestamp_us != self._last_timestamp_us:
+            if self._should_accept_timestamp(sample.timestamp_us, self._last_timestamp_us):
                 self._last_timestamp_us = sample.timestamp_us
                 return sample
             if time.monotonic() > deadline:
@@ -502,6 +655,9 @@ def _acquisition_worker(
     rate: int,
     sensors: list[int],
     output: Optional[str],
+    software_baseline: bool,
+    baseline_duration_sec: float,
+    baseline_std_limit_n: float,
     state: LiveState,
 ) -> None:
     """在独立线程中采集传感器数据，写入共享缓冲区。
@@ -513,10 +669,22 @@ def _acquisition_worker(
         rate: 采集频率，单位 Hz。
         sensors: 需要读取的传感器索引列表。
         output: 可选 CSV 输出路径。
+        software_baseline: 是否启用运行时软件基准扣除。
+        baseline_duration_sec: 软件基准采样时长，单位 s。
+        baseline_std_limit_n: 软件基准扰动检测阈值，单位 N。
         state: 线程安全共享状态对象。
     """
     try:
-        with SensorSession(port, rate, sensors[0], bias=True) as session:
+        with SensorSession(
+            port,
+            rate,
+            sensors[0],
+            bias=True,
+            software_baseline=software_baseline,
+            baseline_duration_sec=baseline_duration_sec,
+            baseline_std_limit_n=baseline_std_limit_n,
+            baseline_sensor_indices=sensors,
+        ) as session:
             with csv_writer(output) as writer:
                 while not state.stop.is_set():
                     multi_sample = session.next_multi_sample(sensors)
@@ -552,6 +720,25 @@ def read(
             help="确认传感器无负载，允许执行 bias 校准",
         ),
     ] = False,
+    software_baseline: Annotated[
+        bool,
+        typer.Option(
+            "--software-baseline/--no-software-baseline",
+            help="SDK bias 后采样无负载均值并在运行时扣除",
+        ),
+    ] = True,
+    baseline_duration_sec: Annotated[
+        float,
+        typer.Option("--baseline-duration", help="软件基准采样时长 (秒)", min=0.1),
+    ] = DEFAULT_BASELINE_DURATION_SEC,
+    baseline_std_limit_n: Annotated[
+        float,
+        typer.Option(
+            "--baseline-std-limit",
+            help="软件基准扰动标准差阈值 (N)",
+            min=0.001,
+        ),
+    ] = DEFAULT_BASELINE_STD_LIMIT_N,
     count: Annotated[
         int,
         typer.Option("--count", "-n", help="读取样本数", min=1),
@@ -559,22 +746,35 @@ def read(
 ) -> None:
     """快速终端读取传感器数据。
 
-    默认读取 10 帧并打印到终端。需要 --confirm-no-load 确认无负载后才执行 bias 校准。
+    默认读取 10 帧并打印到终端。
+    需要 --confirm-no-load 确认无负载后才执行 bias 校准。
 
     Args:
         port: 串口设备路径。
         rate: 采集频率，单位 Hz。
         sensor: 传感器索引。
         confirm_no_load: 是否确认传感器无负载，用于 bias 校准授权。
+        software_baseline: 是否启用软件基准扣除。
+        baseline_duration_sec: 软件基准采样时长，单位 s。
+        baseline_std_limit_n: 软件基准扰动检测阈值，单位 N。
         count: 读取样本数。
     """
     if not confirm_no_load:
         typer.secho(
-            "拒绝执行：bias 校准前必须确认传感器无负载。请添加 --confirm-no-load。",
+            "拒绝执行：bias 校准前必须确认传感器无负载。"
+            "请添加 --confirm-no-load。",
             err=True,
         )
         raise typer.Exit(code=2)
-    with SensorSession(port, rate, sensor, bias=True) as session:
+    with SensorSession(
+        port,
+        rate,
+        sensor,
+        bias=True,
+        software_baseline=software_baseline,
+        baseline_duration_sec=baseline_duration_sec,
+        baseline_std_limit_n=baseline_std_limit_n,
+    ) as session:
         _collect_samples(session, count=count, echo=True)
 
 
@@ -599,6 +799,25 @@ def record(
             help="确认传感器无负载，允许执行 bias 校准",
         ),
     ] = False,
+    software_baseline: Annotated[
+        bool,
+        typer.Option(
+            "--software-baseline/--no-software-baseline",
+            help="SDK bias 后采样无负载均值并在运行时扣除",
+        ),
+    ] = True,
+    baseline_duration_sec: Annotated[
+        float,
+        typer.Option("--baseline-duration", help="软件基准采样时长 (秒)", min=0.1),
+    ] = DEFAULT_BASELINE_DURATION_SEC,
+    baseline_std_limit_n: Annotated[
+        float,
+        typer.Option(
+            "--baseline-std-limit",
+            help="软件基准扰动标准差阈值 (N)",
+            min=0.001,
+        ),
+    ] = DEFAULT_BASELINE_STD_LIMIT_N,
     duration: Annotated[
         float,
         typer.Option("--duration", "-d", help="记录时长 (秒)", min=0.1),
@@ -617,16 +836,28 @@ def record(
         rate: 采集频率，单位 Hz。
         sensor: 传感器索引。
         confirm_no_load: 是否确认传感器无负载，用于 bias 校准授权。
+        software_baseline: 是否启用软件基准扣除。
+        baseline_duration_sec: 软件基准采样时长，单位 s。
+        baseline_std_limit_n: 软件基准扰动检测阈值，单位 N。
         duration: 记录时长，单位 s。
         output: CSV 输出路径。
     """
     if not confirm_no_load:
         typer.secho(
-            "拒绝执行：bias 校准前必须确认传感器无负载。请添加 --confirm-no-load。",
+            "拒绝执行：bias 校准前必须确认传感器无负载。"
+            "请添加 --confirm-no-load。",
             err=True,
         )
         raise typer.Exit(code=2)
-    with SensorSession(port, rate, sensor, bias=True) as session:
+    with SensorSession(
+        port,
+        rate,
+        sensor,
+        bias=True,
+        software_baseline=software_baseline,
+        baseline_duration_sec=baseline_duration_sec,
+        baseline_std_limit_n=baseline_std_limit_n,
+    ) as session:
         with csv_writer(output) as writer:
             typer.echo(f"记录 CSV: {output}")
             samples = _collect_samples(session, duration=duration, writer=writer)
@@ -645,7 +876,12 @@ def live(
     ] = DEFAULT_RATE_HZ,
     sensor: Annotated[
         int,
-        typer.Option("--sensor", help="单传感器索引 (0-9)，未指定 --sensors 时使用", min=0, max=9),
+        typer.Option(
+            "--sensor",
+            help="单传感器索引 (0-9)，未指定 --sensors 时使用",
+            min=0,
+            max=9,
+        ),
     ] = DEFAULT_SENSOR,
     sensors_arg: Annotated[
         Optional[str],
@@ -658,6 +894,25 @@ def live(
             help="确认传感器无负载，允许执行 bias 校准",
         ),
     ] = False,
+    software_baseline: Annotated[
+        bool,
+        typer.Option(
+            "--software-baseline/--no-software-baseline",
+            help="SDK bias 后采样无负载均值并在运行时扣除",
+        ),
+    ] = True,
+    baseline_duration_sec: Annotated[
+        float,
+        typer.Option("--baseline-duration", help="软件基准采样时长 (秒)", min=0.1),
+    ] = DEFAULT_BASELINE_DURATION_SEC,
+    baseline_std_limit_n: Annotated[
+        float,
+        typer.Option(
+            "--baseline-std-limit",
+            help="软件基准扰动标准差阈值 (N)",
+            min=0.001,
+        ),
+    ] = DEFAULT_BASELINE_STD_LIMIT_N,
     window_sec: Annotated[
         float,
         typer.Option("--window", "-w", help="实时曲线窗口秒数", min=1.0),
@@ -685,8 +940,8 @@ def live(
 ) -> None:
     """启动 Dear PyGui 实时力曲线面板。
 
-    支持单传感器或多传感器（最多 2 个）同屏显示。采集在独立线程中进行，
-    避免 GUI 刷新被 SDK 阻塞 I/O 卡住。
+    支持单传感器或多传感器（最多 2 个）同屏显示。
+    采集在独立线程中进行，避免 GUI 刷新被 SDK 阻塞 I/O 卡住。
 
     Args:
         port: 串口设备路径。
@@ -694,6 +949,9 @@ def live(
         sensor: 默认单传感器索引（--sensors 未指定时使用）。
         sensors_arg: 多传感器列表，如 "0,1"。
         confirm_no_load: 是否确认传感器无负载，用于 bias 校准授权。
+        software_baseline: 是否启用软件基准扣除。
+        baseline_duration_sec: 软件基准采样时长，单位 s。
+        baseline_std_limit_n: 软件基准扰动检测阈值，单位 N。
         window_sec: 实时曲线时间窗口，单位 s。
         force_limit: Y 轴力范围限制，单位 N。
         viewport_width: 窗口初始宽度，单位 px。
@@ -703,7 +961,8 @@ def live(
     """
     if not confirm_no_load:
         typer.secho(
-            "拒绝执行：bias 校准前必须确认传感器无负载。请添加 --confirm-no-load。",
+            "拒绝执行：bias 校准前必须确认传感器无负载。"
+            "请添加 --confirm-no-load。",
             err=True,
         )
         raise typer.Exit(code=2)
@@ -721,13 +980,25 @@ def live(
     state = LiveState(max_samples=max_samples)
     worker = threading.Thread(
         target=_acquisition_worker,
-        args=(port, rate, sensors, output, state),
+        args=(
+            port,
+            rate,
+            sensors,
+            output,
+            software_baseline,
+            baseline_duration_sec,
+            baseline_std_limit_n,
+            state,
+        ),
         daemon=True,
     )
     worker.start()
 
     if output and len(sensors) > 1:
-        typer.echo("提示: 多传感器 live 暂不写 CSV；如需记录，请先分别运行单传感器 --sensor。")
+        typer.echo(
+            "提示: 多传感器 live 暂不写 CSV；"
+            "如需记录，请先分别运行单传感器 --sensor。"
+        )
 
     dpg.create_context()
 
@@ -771,10 +1042,18 @@ def live(
                     "fz": f"series_s{sensor_index}_fz",
                     "norm": f"series_s{sensor_index}_norm",
                 }
-                dpg.add_line_series([], [], label="Fx", parent=y_axis, tag=series_tags[sensor_index]["fx"])
-                dpg.add_line_series([], [], label="Fy", parent=y_axis, tag=series_tags[sensor_index]["fy"])
-                dpg.add_line_series([], [], label="Fz", parent=y_axis, tag=series_tags[sensor_index]["fz"])
-                dpg.add_line_series([], [], label="|F|", parent=y_axis, tag=series_tags[sensor_index]["norm"])
+                dpg.add_line_series(
+                    [], [], label="Fx", parent=y_axis, tag=series_tags[sensor_index]["fx"]
+                )
+                dpg.add_line_series(
+                    [], [], label="Fy", parent=y_axis, tag=series_tags[sensor_index]["fy"]
+                )
+                dpg.add_line_series(
+                    [], [], label="Fz", parent=y_axis, tag=series_tags[sensor_index]["fz"]
+                )
+                dpg.add_line_series(
+                    [], [], label="|F|", parent=y_axis, tag=series_tags[sensor_index]["norm"]
+                )
 
     dpg.setup_dearpygui()
     dpg.show_viewport()
@@ -814,10 +1093,14 @@ def live(
                     dpg.set_value(tags["fx"], [sensor_xs, [s.fx for s in visible_sensor_samples]])
                     dpg.set_value(tags["fy"], [sensor_xs, [s.fy for s in visible_sensor_samples]])
                     dpg.set_value(tags["fz"], [sensor_xs, [s.fz for s in visible_sensor_samples]])
-                    dpg.set_value(tags["norm"], [sensor_xs, [s.force_norm for s in visible_sensor_samples]])
+                    dpg.set_value(
+                        tags["norm"],
+                        [sensor_xs, [s.force_norm for s in visible_sensor_samples]],
+                    )
                 dpg.set_value(
                     "status",
-                    f"port={port}  sensors={','.join(str(s) for s in sensors)}  rate={rate}Hz  samples={state.count}",
+                    f"port={port}  sensors={','.join(str(s) for s in sensors)}  "
+                    f"rate={rate}Hz  samples={state.count}",
                 )
                 latest_stats = []
                 for sensor_index in sensors:
@@ -911,32 +1194,63 @@ def check(
             help="确认传感器无负载，允许执行 bias 校准",
         ),
     ] = False,
+    software_baseline: Annotated[
+        bool,
+        typer.Option(
+            "--software-baseline/--no-software-baseline",
+            help="SDK bias 后采样无负载均值并在运行时扣除",
+        ),
+    ] = True,
+    baseline_duration_sec: Annotated[
+        float,
+        typer.Option("--baseline-duration", help="软件基准采样时长 (秒)", min=0.1),
+    ] = DEFAULT_BASELINE_DURATION_SEC,
+    baseline_std_limit_n: Annotated[
+        float,
+        typer.Option(
+            "--baseline-std-limit",
+            help="软件基准扰动标准差阈值 (N)",
+            min=0.001,
+        ),
+    ] = DEFAULT_BASELINE_STD_LIMIT_N,
     duration: Annotated[
         float,
         typer.Option("--duration", "-d", help="检查时长 (秒)", min=0.1),
     ] = 5.0,
 ) -> None:
-    """静态噪声和采样间隔检查。
+    """校正后残余静态噪声和采样间隔检查。
 
-    在传感器无负载状态下采集数据，统计各轴噪声水平和实际采样间隔分布，
-    用于评估传感器健康状态和连接质量。
+    在传感器无负载状态下采集校正后的数据，统计各轴残余噪声水平和实际
+    采样间隔分布，用于评估软件基准后的传感器健康状态和连接质量。
 
     Args:
         port: 串口设备路径。
         rate: 采集频率，单位 Hz。
         sensor: 传感器索引。
         confirm_no_load: 是否确认传感器无负载，用于 bias 校准授权。
+        software_baseline: 是否启用软件基准扣除。
+        baseline_duration_sec: 软件基准采样时长，单位 s。
+        baseline_std_limit_n: 软件基准扰动检测阈值，单位 N。
         duration: 检查时长，单位 s。
     """
     if not confirm_no_load:
         typer.secho(
-            "拒绝执行：bias 校准前必须确认传感器无负载。请添加 --confirm-no-load。",
+            "拒绝执行：bias 校准前必须确认传感器无负载。"
+            "请添加 --confirm-no-load。",
             err=True,
         )
         raise typer.Exit(code=2)
-    with SensorSession(port, rate, sensor, bias=True) as session:
+    with SensorSession(
+        port,
+        rate,
+        sensor,
+        bias=True,
+        software_baseline=software_baseline,
+        baseline_duration_sec=baseline_duration_sec,
+        baseline_std_limit_n=baseline_std_limit_n,
+    ) as session:
         samples = _collect_samples(session, duration=duration)
-    _summarize(samples, "Check summary")
+    _summarize(samples, "Check summary (corrected residual noise)")
     for axis_name, values in (
         ("fx", [s.fx for s in samples]),
         ("fy", [s.fy for s in samples]),
