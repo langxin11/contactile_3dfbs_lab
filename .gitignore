@@ -22,8 +22,8 @@ vendor/
 .vscode/
 .idea/
 
-# Claude Code
-.codex/
+# Claude Code / Codex / Copilot agent instructions (symlinks to AGENTS.md)
+
 
 # 原厂二进制 SDK（ros2_ws 中的旧版副本）
 ros2_ws/src/buttonsensor_ros2_v1/lib/*.a
