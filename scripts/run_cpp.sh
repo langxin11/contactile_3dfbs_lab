@@ -1,6 +1,6 @@
 #!/bin/bash
 # 编译并运行 C++ 读取/记录示例
-# 用法: bash scripts/run_cpp.sh -- --confirm-no-load --duration 2 --output /tmp/cpp_rate.csv
+# 用法: bash scripts/run_cpp.sh -- --duration 2 --output /tmp/cpp_rate.csv
 
 set -euo pipefail
 LAB_ROOT="$(cd "$(dirname "$0")/.." && pwd)"

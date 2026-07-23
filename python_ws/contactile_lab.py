@@ -3,23 +3,24 @@
 Contactile 3DFBS lab CLI — 统一的传感器采集、记录、实时预览和回放工具。
 
 用法:
-    # 快速读取（单传感器，含 software baseline）
-    uv run python contactile_lab.py read --confirm-no-load --count 20
+    # 快速读取（默认不执行硬件去皮或 software baseline）
+    uv run python contactile_lab.py read --count 20
 
     # 记录到 CSV
-    uv run python contactile_lab.py record --confirm-no-load --duration 10
+    uv run python contactile_lab.py record --duration 10
 
     # 双传感器实时力曲线
-    uv run python contactile_lab.py live --confirm-no-load --sensors 0,1
+    uv run python contactile_lab.py live --sensors 0,1
 
     # 离线回放
     uv run python contactile_lab.py replay data/run.csv
 
-    # 跳过 software baseline，仅用 SDK bias 对比
-    uv run python contactile_lab.py check --confirm-no-load --no-software-baseline
+    # 按需显式启用硬件去皮和 software baseline
+    uv run python contactile_lab.py check --bias --software-baseline
 
-默认先执行 SDK bias，再采样 2 秒软件基准；若任一轴标准差超过 0.02 N，
-会认为基准期间存在触碰或扰动并停止运行。CSV 默认保存校正后的力数据。
+默认不执行 SDK bias 或软件基准扣除，并在终端明确提示。启用软件基准时，
+若任一轴标准差超过 0.02 N，会认为基准期间存在触碰或扰动并停止运行。
+CSV 保存当前所选校正方式处理后的力数据。
 --rate 是 CLI 目标输出频率；SDK 实际更新更快时会按 timestamp 软件降采样。
 """
 
@@ -27,7 +28,6 @@ import csv
 import math
 import os
 import statistics
-import sys
 import threading
 import time
 from collections import deque
@@ -218,7 +218,7 @@ def _parse_sensor_list(value: str) -> list[int]:
 class SensorSession:
     """管理传感器连接的上下文管理器，确保异常时释放串口。
 
-    进入上下文时自动连接串口、执行 bias 校准（如果 bias=True），
+    进入上下文时自动连接串口、按需执行 bias 去皮（如果 bias=True），
     并可计算软件基准。
     退出上下文时自动调用 stopListeningAndDisconnect() 释放串口。
 
@@ -226,7 +226,7 @@ class SensorSession:
         port: 串口设备路径，如 "/dev/ttyACM0"。
         rate_hz: 目标采集频率，可选 100/500/1000 Hz。
         sensor_index: 主传感器索引，范围 0..MAX_SENSOR_SLOTS-1。
-        bias: 是否在连接后执行 bias 校准。
+        bias: 是否在连接后执行硬件去皮。
         software_baseline: 是否启用运行时软件基准扣除。
         baseline_duration_sec: 软件基准采样时长，单位 s。
         baseline_std_limit_n: 软件基准扰动检测阈值，单位 N。
@@ -239,8 +239,8 @@ class SensorSession:
         rate_hz: int,
         sensor_index: int = DEFAULT_SENSOR,
         *,
-        bias: bool = True,
-        software_baseline: bool = True,
+        bias: bool = False,
+        software_baseline: bool = False,
         baseline_duration_sec: float = DEFAULT_BASELINE_DURATION_SEC,
         baseline_std_limit_n: float = DEFAULT_BASELINE_STD_LIMIT_N,
         baseline_sensor_indices: Optional[list[int]] = None,
@@ -287,12 +287,16 @@ class SensorSession:
 
             time.sleep(0.5)  # 等待稳定连接
             if self.bias:
-                typer.echo("Bias 校准中（请保持传感器无负载）...")
+                typer.echo("执行初始硬件去皮...")
                 if not self.listener.sendBiasRequest():
-                    raise RuntimeError("Bias 失败")
-                typer.echo("Bias 成功")
+                    raise RuntimeError("硬件去皮失败")
+                typer.echo("硬件去皮完成")
+            else:
+                typer.echo("未执行初始硬件去皮")
             if self.software_baseline:
                 self._compute_software_baseline(self.baseline_sensor_indices)
+            else:
+                typer.echo("未执行初始软件基准扣除")
         except BaseException:
             self.close()
             raise
@@ -655,6 +659,7 @@ def _acquisition_worker(
     rate: int,
     sensors: list[int],
     output: Optional[str],
+    bias: bool,
     software_baseline: bool,
     baseline_duration_sec: float,
     baseline_std_limit_n: float,
@@ -669,6 +674,7 @@ def _acquisition_worker(
         rate: 采集频率，单位 Hz。
         sensors: 需要读取的传感器索引列表。
         output: 可选 CSV 输出路径。
+        bias: 是否在连接后执行硬件去皮。
         software_baseline: 是否启用运行时软件基准扣除。
         baseline_duration_sec: 软件基准采样时长，单位 s。
         baseline_std_limit_n: 软件基准扰动检测阈值，单位 N。
@@ -679,7 +685,7 @@ def _acquisition_worker(
             port,
             rate,
             sensors[0],
-            bias=True,
+            bias=bias,
             software_baseline=software_baseline,
             baseline_duration_sec=baseline_duration_sec,
             baseline_std_limit_n=baseline_std_limit_n,
@@ -713,20 +719,20 @@ def read(
         int,
         typer.Option("--sensor", "-s", help="传感器索引 (0-9)", min=0, max=9),
     ] = DEFAULT_SENSOR,
-    confirm_no_load: Annotated[
+    bias: Annotated[
         bool,
         typer.Option(
-            "--confirm-no-load",
-            help="确认传感器无负载，允许执行 bias 校准",
+            "--bias",
+            help="连接后执行一次硬件去皮；默认不执行",
         ),
     ] = False,
     software_baseline: Annotated[
         bool,
         typer.Option(
             "--software-baseline/--no-software-baseline",
-            help="SDK bias 后采样无负载均值并在运行时扣除",
+            help="连接后采样基准均值并在运行时扣除；默认不执行",
         ),
-    ] = True,
+    ] = False,
     baseline_duration_sec: Annotated[
         float,
         typer.Option("--baseline-duration", help="软件基准采样时长 (秒)", min=0.1),
@@ -746,31 +752,23 @@ def read(
 ) -> None:
     """快速终端读取传感器数据。
 
-    默认读取 10 帧并打印到终端。
-    需要 --confirm-no-load 确认无负载后才执行 bias 校准。
+    默认不执行硬件去皮或软件基准扣除，读取 10 帧并打印到终端。
 
     Args:
         port: 串口设备路径。
         rate: 采集频率，单位 Hz。
         sensor: 传感器索引。
-        confirm_no_load: 是否确认传感器无负载，用于 bias 校准授权。
+        bias: 是否在连接后执行硬件去皮。
         software_baseline: 是否启用软件基准扣除。
         baseline_duration_sec: 软件基准采样时长，单位 s。
         baseline_std_limit_n: 软件基准扰动检测阈值，单位 N。
         count: 读取样本数。
     """
-    if not confirm_no_load:
-        typer.secho(
-            "拒绝执行：bias 校准前必须确认传感器无负载。"
-            "请添加 --confirm-no-load。",
-            err=True,
-        )
-        raise typer.Exit(code=2)
     with SensorSession(
         port,
         rate,
         sensor,
-        bias=True,
+        bias=bias,
         software_baseline=software_baseline,
         baseline_duration_sec=baseline_duration_sec,
         baseline_std_limit_n=baseline_std_limit_n,
@@ -792,20 +790,20 @@ def record(
         int,
         typer.Option("--sensor", "-s", help="传感器索引 (0-9)", min=0, max=9),
     ] = DEFAULT_SENSOR,
-    confirm_no_load: Annotated[
+    bias: Annotated[
         bool,
         typer.Option(
-            "--confirm-no-load",
-            help="确认传感器无负载，允许执行 bias 校准",
+            "--bias",
+            help="连接后执行一次硬件去皮；默认不执行",
         ),
     ] = False,
     software_baseline: Annotated[
         bool,
         typer.Option(
             "--software-baseline/--no-software-baseline",
-            help="SDK bias 后采样无负载均值并在运行时扣除",
+            help="连接后采样基准均值并在运行时扣除；默认不执行",
         ),
-    ] = True,
+    ] = False,
     baseline_duration_sec: Annotated[
         float,
         typer.Option("--baseline-duration", help="软件基准采样时长 (秒)", min=0.1),
@@ -835,25 +833,18 @@ def record(
         port: 串口设备路径。
         rate: 采集频率，单位 Hz。
         sensor: 传感器索引。
-        confirm_no_load: 是否确认传感器无负载，用于 bias 校准授权。
+        bias: 是否在连接后执行硬件去皮。
         software_baseline: 是否启用软件基准扣除。
         baseline_duration_sec: 软件基准采样时长，单位 s。
         baseline_std_limit_n: 软件基准扰动检测阈值，单位 N。
         duration: 记录时长，单位 s。
         output: CSV 输出路径。
     """
-    if not confirm_no_load:
-        typer.secho(
-            "拒绝执行：bias 校准前必须确认传感器无负载。"
-            "请添加 --confirm-no-load。",
-            err=True,
-        )
-        raise typer.Exit(code=2)
     with SensorSession(
         port,
         rate,
         sensor,
-        bias=True,
+        bias=bias,
         software_baseline=software_baseline,
         baseline_duration_sec=baseline_duration_sec,
         baseline_std_limit_n=baseline_std_limit_n,
@@ -887,20 +878,20 @@ def live(
         Optional[str],
         typer.Option("--sensors", "-s", help="同屏显示多个传感器，例如 0,1"),
     ] = None,
-    confirm_no_load: Annotated[
+    bias: Annotated[
         bool,
         typer.Option(
-            "--confirm-no-load",
-            help="确认传感器无负载，允许执行 bias 校准",
+            "--bias",
+            help="连接后执行一次硬件去皮；默认不执行",
         ),
     ] = False,
     software_baseline: Annotated[
         bool,
         typer.Option(
             "--software-baseline/--no-software-baseline",
-            help="SDK bias 后采样无负载均值并在运行时扣除",
+            help="连接后采样基准均值并在运行时扣除；默认不执行",
         ),
-    ] = True,
+    ] = False,
     baseline_duration_sec: Annotated[
         float,
         typer.Option("--baseline-duration", help="软件基准采样时长 (秒)", min=0.1),
@@ -948,7 +939,7 @@ def live(
         rate: 采集频率，单位 Hz。
         sensor: 默认单传感器索引（--sensors 未指定时使用）。
         sensors_arg: 多传感器列表，如 "0,1"。
-        confirm_no_load: 是否确认传感器无负载，用于 bias 校准授权。
+        bias: 是否在连接后执行硬件去皮。
         software_baseline: 是否启用软件基准扣除。
         baseline_duration_sec: 软件基准采样时长，单位 s。
         baseline_std_limit_n: 软件基准扰动检测阈值，单位 N。
@@ -959,13 +950,6 @@ def live(
         font_size: 界面字体大小，单位 px。
         output: 可选 CSV 输出路径（多传感器时不写入）。
     """
-    if not confirm_no_load:
-        typer.secho(
-            "拒绝执行：bias 校准前必须确认传感器无负载。"
-            "请添加 --confirm-no-load。",
-            err=True,
-        )
-        raise typer.Exit(code=2)
     try:
         import dearpygui.dearpygui as dpg
     except ImportError as exc:
@@ -985,6 +969,7 @@ def live(
             rate,
             sensors,
             output,
+            bias,
             software_baseline,
             baseline_duration_sec,
             baseline_std_limit_n,
@@ -1076,7 +1061,6 @@ def live(
                 t_latest = latest.timestamp_us
                 window_start = t_latest - int(window_sec * 1_000_000)
                 visible = [s for s in samples if s.timestamp_us >= window_start]
-                xs = [(s.timestamp_us - t_latest) / 1_000_000.0 for s in visible]
                 for sensor_index in sensors:
                     dpg.set_axis_limits(y_axis_tags[sensor_index], -force_limit, force_limit)
                     visible_sensor_samples = [
@@ -1187,20 +1171,20 @@ def check(
         int,
         typer.Option("--sensor", "-s", help="传感器索引 (0-9)", min=0, max=9),
     ] = DEFAULT_SENSOR,
-    confirm_no_load: Annotated[
+    bias: Annotated[
         bool,
         typer.Option(
-            "--confirm-no-load",
-            help="确认传感器无负载，允许执行 bias 校准",
+            "--bias",
+            help="连接后执行一次硬件去皮；默认不执行",
         ),
     ] = False,
     software_baseline: Annotated[
         bool,
         typer.Option(
             "--software-baseline/--no-software-baseline",
-            help="SDK bias 后采样无负载均值并在运行时扣除",
+            help="连接后采样基准均值并在运行时扣除；默认不执行",
         ),
-    ] = True,
+    ] = False,
     baseline_duration_sec: Annotated[
         float,
         typer.Option("--baseline-duration", help="软件基准采样时长 (秒)", min=0.1),
@@ -1218,39 +1202,32 @@ def check(
         typer.Option("--duration", "-d", help="检查时长 (秒)", min=0.1),
     ] = 5.0,
 ) -> None:
-    """校正后残余静态噪声和采样间隔检查。
+    """力信号和采样间隔检查。
 
-    在传感器无负载状态下采集校正后的数据，统计各轴残余噪声水平和实际
-    采样间隔分布，用于评估软件基准后的传感器健康状态和连接质量。
+    采集当前去皮与基准配置下的数据，统计各轴信号水平和实际采样间隔分布，
+    用于评估传感器状态和连接质量。
 
     Args:
         port: 串口设备路径。
         rate: 采集频率，单位 Hz。
         sensor: 传感器索引。
-        confirm_no_load: 是否确认传感器无负载，用于 bias 校准授权。
+        bias: 是否在连接后执行硬件去皮。
         software_baseline: 是否启用软件基准扣除。
         baseline_duration_sec: 软件基准采样时长，单位 s。
         baseline_std_limit_n: 软件基准扰动检测阈值，单位 N。
         duration: 检查时长，单位 s。
     """
-    if not confirm_no_load:
-        typer.secho(
-            "拒绝执行：bias 校准前必须确认传感器无负载。"
-            "请添加 --confirm-no-load。",
-            err=True,
-        )
-        raise typer.Exit(code=2)
     with SensorSession(
         port,
         rate,
         sensor,
-        bias=True,
+        bias=bias,
         software_baseline=software_baseline,
         baseline_duration_sec=baseline_duration_sec,
         baseline_std_limit_n=baseline_std_limit_n,
     ) as session:
         samples = _collect_samples(session, duration=duration)
-    _summarize(samples, "Check summary (corrected residual noise)")
+    _summarize(samples, "Check summary")
     for axis_name, values in (
         ("fx", [s.fx for s in samples]),
         ("fy", [s.fy for s in samples]),

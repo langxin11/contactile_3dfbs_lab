@@ -60,7 +60,7 @@ if not os.path.exists(port):
 
 ## 6. 硬件安全
 
-- **Bias 校准**：`sendBiasRequest()` 前必须确保传感器**无负载**，否则零点漂移
+- **Bias 去皮**：程序启动时默认不调用 `sendBiasRequest()`；需要时通过普通 `--bias` 参数显式启用
 - **串口释放**：异常退出时必须调用 `stopListeningAndDisconnect()`，否则 `/dev/ttyACM0` 锁死
 - **波特率**：C++/ROS2 默认 9600，Python 默认 115200，修改时确保 DEV001 固件一致
 
@@ -109,7 +109,7 @@ def read(
 - CLI 只解析参数和错误退出，业务逻辑下沉到普通函数
 - `Argument` = 必须给出的主要对象；`Option` = 可选配置
 - 串口用 `str`（`Path` 校验会误杀字符设备），内部显式检查存在性
-- bias 等危险操作必须显式确认参数（如 `--confirm-no-load`），否则拒绝执行
+- 启动时默认不执行 bias 或软件基准扣除，并在终端明确提示；需要时用普通选项启用
 - 输出：`echo()` 普通信息，`secho(..., err=True)` 错误
 - 捕获 `PermissionError`（提示 dialout 组）、`KeyboardInterrupt`（释放串口）
 - 测试用 `CliRunner`，默认 `--mock`，不依赖硬件
