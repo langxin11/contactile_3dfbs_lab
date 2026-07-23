@@ -3,7 +3,7 @@
  *
  * 编译运行:
  *   bash scripts/run_cpp.sh -- --help
- *   bash scripts/run_cpp.sh -- --confirm-no-load --duration 2 --output /tmp/cpp_rate.csv
+ *   bash scripts/run_cpp.sh -- --duration 2 --output /tmp/cpp_rate.csv
  *
  * 不依赖 ROS2，直接链接原厂 libPTSDK.a 静态库。
  * 默认使用阻塞式 readNextSample()，避免 Python 轮询和逐帧终端打印影响采样率。
@@ -34,8 +34,7 @@ struct Options {
     double duration_sec = 0.0;
     std::string output_path;
     int print_every = 0;
-    bool confirm_no_load = false;
-    bool bias = true;
+    bool bias = false;
 };
 
 class ListenerConnectionGuard {
@@ -78,13 +77,12 @@ void printUsage(const char *program)
     printf("  --duration SEC           记录时长；不指定则持续运行直到 Ctrl+C\n");
     printf("  --output PATH            写入 CSV；不指定则只统计\n");
     printf("  --print-every N          每 N 个样本打印一行；默认 0 表示不逐帧打印\n");
-    printf("  --confirm-no-load        确认传感器无负载，允许 bias 校准\n");
-    printf("  --no-bias                跳过 bias 校准\n");
+    printf("  --bias                   连接后执行一次硬件去皮；默认不执行\n");
     printf("  --help                   显示帮助\n");
     printf("\n");
     printf("示例:\n");
-    printf("  bash scripts/run_cpp.sh -- --confirm-no-load --duration 2 --output /tmp/cpp_rate.csv\n");
-    printf("  bash scripts/run_cpp.sh -- --baud-rate 115200 --confirm-no-load --duration 2\n");
+    printf("  bash scripts/run_cpp.sh -- --duration 2 --output /tmp/cpp_rate.csv\n");
+    printf("  bash scripts/run_cpp.sh -- --baud-rate 115200 --bias --duration 2\n");
 }
 
 bool parseInt(const char *text, int *value)
@@ -157,10 +155,8 @@ bool parseArgs(int argc, char *argv[], Options *options)
                 fprintf(stderr, "--print-every 必须是整数\n");
                 return false;
             }
-        } else if (arg == "--confirm-no-load") {
-            options->confirm_no_load = true;
-        } else if (arg == "--no-bias") {
-            options->bias = false;
+        } else if (arg == "--bias") {
+            options->bias = true;
         } else if (arg.rfind("-", 0) != 0 && i == 1) {
             options->port = arg;
         } else {
@@ -183,10 +179,6 @@ bool parseArgs(int argc, char *argv[], Options *options)
     }
     if (options->print_every < 0) {
         fprintf(stderr, "--print-every 不能小于 0\n");
-        return false;
-    }
-    if (options->bias && !options->confirm_no_load) {
-        fprintf(stderr, "拒绝执行: bias 前必须确认传感器无负载，请添加 --confirm-no-load，或用 --no-bias 跳过。\n");
         return false;
     }
     return true;
@@ -243,18 +235,18 @@ int main(int argc, char *argv[])
     }
 
     if (options.bias) {
-        printf("发送 Bias 请求，请保持传感器无负载...\n");
+        printf("执行初始硬件去皮...\n");
         if (!listener.sendBiasRequest()) {
-            fprintf(stderr, "Bias 请求失败\n");
+            fprintf(stderr, "硬件去皮失败\n");
             return 1;
         }
-        printf("Bias 完成\n");
+        printf("硬件去皮完成\n");
     } else {
-        printf("跳过 Bias\n");
+        printf("未执行初始硬件去皮\n");
     }
 
     if (!g_running) {
-        fprintf(stderr, "Bias 期间收到中断，停止运行\n");
+        fprintf(stderr, "初始硬件去皮期间收到中断，停止运行\n");
         return 130;
     }
 

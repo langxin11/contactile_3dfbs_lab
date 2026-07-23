@@ -1,10 +1,11 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 Contactile 3DFBS 最小读取器 (Python)
 
 用法:
     python quick_read.py
     python quick_read.py --port /dev/ttyACM1 --count 20
+    python quick_read.py --bias
 """
 
 import argparse
@@ -19,13 +20,13 @@ def main():
     parser = argparse.ArgumentParser(description="Contactile 3DFBS quick reader")
     parser.add_argument("--port", default="/dev/ttyACM0", help="串口设备路径")
     parser.add_argument("--count", type=int, default=10, help="读取次数")
+    parser.add_argument("--bias", action="store_true", help="连接后执行一次硬件去皮")
     args = parser.parse_args()
 
     port = args.port
     rate = 115200
     parity = 0
     byte_size = '\x08'
-    log_rate = fbs.PTSDKConstants.LOG_RATE_100
 
     # 预检查：避免进入 C++ 阻塞调用导致 Ctrl+C 失效
     if not os.path.exists(port):
@@ -48,13 +49,15 @@ def main():
         print(f"连接失败！错误码: {res}")
         return
 
-    # 校准
-    print("Bias 校准中（请保持传感器无负载）...")
-    if listener.sendBiasRequest():
-        print("Bias 成功")
+    if args.bias:
+        print("执行初始硬件去皮...")
+        if not listener.sendBiasRequest():
+            print("硬件去皮失败！")
+            listener.stopListeningAndDisconnect()
+            return
+        print("硬件去皮完成")
     else:
-        print("Bias 失败！")
-        return
+        print("未执行初始硬件去皮")
 
     # 开始监听
     listener.startListening()
