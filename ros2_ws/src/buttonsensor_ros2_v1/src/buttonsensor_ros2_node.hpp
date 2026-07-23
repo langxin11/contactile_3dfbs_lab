@@ -17,15 +17,19 @@
 // Services
 #include "sensor_interfaces/srv/bias_request.hpp"
 
-#ifdef __unix__
-typedef unsigned char byte;
-#endif
-
 #ifndef PTSDKCONSTANTS_H
 #include <PTSDKConstants.h>
 #endif
+// Workaround for vendor SDK: PTSDKListener.h defines BYTE as byte and also
+// imports std::byte via "using namespace std", which is ambiguous under ROS2.
+#ifdef __unix__
+#define byte unsigned char
+#endif
 #ifndef PTSDKLISTENER_H
 #include <PTSDKListener.h>
+#endif
+#ifdef __unix__
+#undef byte
 #endif
 #ifndef PTSDKSENSOR_H
 #include <PTSDKSensor.h>
