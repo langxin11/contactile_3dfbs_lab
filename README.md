@@ -39,7 +39,8 @@ bash scripts/check_usb.sh
 # 3. 选择链路运行
 
 # C++
-bash scripts/run_cpp.sh
+bash scripts/run_cpp.sh -- --help
+bash scripts/run_cpp.sh -- --confirm-no-load --duration 2 --output /tmp/cpp_rate.csv
 
 # Python
 bash scripts/run_python.sh quick_read

@@ -17,6 +17,37 @@
 
 ## 使用步骤
 
+项目内已封装可直接运行的 C++ 记录/测速示例：
+
+```bash
+# 查看参数
+bash scripts/run_cpp.sh -- --help
+
+# 2 秒 CSV 记录；bias 前必须确认传感器无负载
+bash scripts/run_cpp.sh -- \
+  --confirm-no-load \
+  --duration 2 \
+  --output /tmp/cpp_rate.csv
+
+# 如果 DEV001 固件/当前配置使用 115200 baud，可显式覆盖
+bash scripts/run_cpp.sh -- \
+  --baud-rate 115200 \
+  --confirm-no-load \
+  --duration 2 \
+  --output /tmp/cpp_rate_115200.csv
+
+# 只统计吞吐，不写 CSV，不逐帧打印
+bash scripts/run_cpp.sh -- --confirm-no-load --duration 2
+```
+
+CSV 字段与 Python 记录器保持一致：
+
+```text
+timestamp_us,t_monotonic_ns,fx,fy,fz,force_norm
+```
+
+测速时不要逐帧打印到终端；如需抽样观察，可加 `--print-every 100`。
+
 ```cpp
 #include "PTSDKConstants.h"
 #include "PTSDKListener.h"
