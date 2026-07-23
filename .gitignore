@@ -10,10 +10,12 @@ cpp_ws/build/
 ros2_ws/build/
 ros2_ws/install/
 ros2_ws/log/
+ros2_ws/Logs/
 
 # Data
 data/*
 !data/.gitkeep
+python_ws/data/
 
 # Vendor SDK (原厂二进制，从 USB 盘复制)
 vendor/
