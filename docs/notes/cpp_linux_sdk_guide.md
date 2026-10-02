@@ -23,21 +23,22 @@
 # 查看参数
 bash scripts/run_cpp.sh -- --help
 
-# 2 秒 CSV 记录；bias 前必须确认传感器无负载
+# 2 秒 CSV 记录；默认不执行初始硬件去皮
 bash scripts/run_cpp.sh -- \
-  --confirm-no-load \
   --duration 2 \
   --output /tmp/cpp_rate.csv
 
 # 如果 DEV001 固件/当前配置使用 115200 baud，可显式覆盖
 bash scripts/run_cpp.sh -- \
   --baud-rate 115200 \
-  --confirm-no-load \
   --duration 2 \
   --output /tmp/cpp_rate_115200.csv
 
 # 只统计吞吐，不写 CSV，不逐帧打印
-bash scripts/run_cpp.sh -- --confirm-no-load --duration 2
+bash scripts/run_cpp.sh -- --duration 2
+
+# 需要初始硬件去皮时显式启用，不需要额外确认参数
+bash scripts/run_cpp.sh -- --bias --duration 2
 ```
 
 CSV 字段与 Python 记录器保持一致：

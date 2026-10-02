@@ -6,7 +6,7 @@ C++ / Python / ROS2 三条链路共用同一套 vendor SDK 和硬件，属于并
 graph TB
     subgraph CppCol["🟠 C++ 链路 — 最低延迟"]
         direction TB
-        C1["cpp_ws/src/minimal_reader.cpp<br/>connect → bias → readNextSample → CSV/统计"]
+        C1["cpp_ws/src/minimal_reader.cpp<br/>connect → 可选 bias → readNextSample → CSV/统计"]
         C2["CMake + Make<br/>cpp_ws/src/CMakeLists.txt"]
         C3["libPTSDK.a (静态链接)<br/>vendor/C++LIN/"]
         C4["参数: 9600 baud, pthread"]

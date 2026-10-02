@@ -40,7 +40,7 @@ bash scripts/check_usb.sh
 
 # C++
 bash scripts/run_cpp.sh -- --help
-bash scripts/run_cpp.sh -- --confirm-no-load --duration 2 --output /tmp/cpp_rate.csv
+bash scripts/run_cpp.sh -- --duration 2 --output /tmp/cpp_rate.csv
 
 # Python
 bash scripts/run_python.sh quick_read
@@ -68,7 +68,7 @@ bash scripts/run_ros2.sh --real
 | `baud_rate` | 9600 (C++/ROS2) / 115200 (Python) | 波特率 |
 | `sensor_count` | 1 | 连接的传感器数量 |
 | `mock_mode` | false | true = 无硬件发布正弦波 |
-| `bias_on_startup` | true | 启动时自动零点校准 |
+| `bias_on_startup` | false | 默认不去皮；传入 `--bias` 时执行 |
 
 ## 串口权限
 
